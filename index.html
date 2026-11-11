@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#020617" />
+  <title>AETHER-VAULT | Secure File Vault Demo</title>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #020617; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    .dropzone { transition: border-color .2s, background .2s; }
+    .dropzone:hover { border-color: #06b6d4; background: rgba(8,145,178,.08); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState } = React;
+
+    // Lightweight text-symbol icons. This avoids the incompatible Lucide
+    // React-component usage that caused React error #130.
+    const ICONS = {
+      Shield: "⬡", HardDrive: "▣", Layers: "▱", Cpu: "▦", Key: "⚿",
+      RefreshCw: "↻", Copy: "▢", Check: "✓", Lock: "🔒", Unlock: "🔓",
+      Upload: "↑", FileText: "▤", Download: "↓", CheckCircle2: "✓",
+      AlertTriangle: "⚠", Info: "ⓘ", Zap: "ϟ", File: "▧"
+    };
+    function Icon({ name, className = "" }) {
+      return <span aria-hidden="true" className={"inline-flex items-center justify-center leading-none " + className}>{ICONS[name] || "•"}</span>;
+    }
+
+    const bytesToHex = (buffer) =>
+      Array.from(new Uint8Array(buffer), b => b.toString(16).padStart(2, "0")).join("");
+
+    const hexToBytes = (hex) => {
+      if (typeof hex !== "string" || hex.length % 2 || !/^[0-9a-f]*$/i.test(hex)) {
+        throw new Error("The vault file contains invalid encrypted data.");
+      }
+      return new Uint8Array(hex.match(/.{2}/g)?.map(x => parseInt(x, 16)) || []);
+    };
+
+    const randomHex = (length) => {
+      const bytes = crypto.getRandomValues(new Uint8Array(length));
+      return bytesToHex(bytes);
+    };
+
+    async function deriveAesKey(passphrase, salt) {
+      const encoder = new TextEncoder();
+      const material = await crypto.subtle.importKey(
+        "raw", encoder.encode(passphrase), "PBKDF2", false, ["deriveKey"]
+      );
+      return crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt, iterations: 310000, hash: "SHA-256" },
+        material,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt", "decrypt"]
+      );
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function App() {
+      const [tab, setTab] = useState("vault");
+      const [mode, setMode] = useState("encrypt");
+      const [file, setFile] = useState(null);
+      const [passphrase, setPassphrase] = useState("");
+      const [busy, setBusy] = useState(false);
+      const [packageData, setPackageData] = useState(null);
+      const [vaultFile, setVaultFile] = useState(null);
+      const [decryptPassword, setDecryptPassword] = useState("");
+      const [status, setStatus] = useState(null);
+      const [simKeys, setSimKeys] = useState(null);
+      const [showPassword, setShowPassword] = useState(false);
+
+      const notify = (type, message) => setStatus({ type, message });
+
+      const selectVaultFile = async (selected) => {
+        if (!selected) return;
+        try {
+          const parsed = JSON.parse(await selected.text());
+          if (parsed.format !== "AETHER-VAULT" || parsed.version !== 1 ||
+              !parsed.saltHex || !parsed.ivHex || !parsed.ciphertextHex) {
+            throw new Error("This is not a valid AETHER-VAULT package.");
+          }
+          setVaultFile({ name: selected.name, data: parsed });
+          setStatus(null);
+        } catch (error) {
+          notify("error", error.message || "Could not read the vault package.");
+          setVaultFile(null);
+        }
+      };
+
+      const encryptFile = async () => {
+        if (!file) return notify("error", "Choose a file first.");
+        if (passphrase.length < 12) return notify("error", "Use a passphrase with at least 12 characters.");
+        if (!window.crypto?.subtle) return notify("error", "Web Crypto is unavailable. Open this site over HTTPS in a modern browser.");
+        setBusy(true);
+        setStatus(null);
+        try {
+          const salt = crypto.getRandomValues(new Uint8Array(16));
+          const iv = crypto.getRandomValues(new Uint8Array(12));
+          const key = await deriveAesKey(passphrase, salt);
+          const plainBytes = await file.arrayBuffer();
+          const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plainBytes);
+
+          const pkg = {
+            format: "AETHER-VAULT",
+            version: 1,
+            encryption: "AES-256-GCM",
+            keyDerivation: "PBKDF2-SHA-256",
+            iterations: 310000,
+            createdAt: new Date().toISOString(),
+            fileName: file.name,
+            fileSize: file.size,
+            fileType: file.type || "application/octet-stream",
+            saltHex: bytesToHex(salt),
+            ivHex: bytesToHex(iv),
+            ciphertextHex: bytesToHex(encrypted)
+          };
+          setPackageData(pkg);
+          notify("success", "File encrypted successfully. Download the .pqvault package to keep it.");
+        } catch (error) {
+          console.error(error);
+          notify("error", "Encryption failed: " + (error.message || "unknown error"));
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const decryptFile = async () => {
+        if (!vaultFile) return notify("error", "Choose a .pqvault file first.");
+        if (!decryptPassword) return notify("error", "Enter the passphrase used to encrypt this file.");
+        setBusy(true);
+        setStatus(null);
+        try {
+          const pkg = vaultFile.data;
+          const salt = hexToBytes(pkg.saltHex);
+          const iv = hexToBytes(pkg.ivHex);
+          const ciphertext = hexToBytes(pkg.ciphertextHex);
+          const key = await deriveAesKey(decryptPassword, salt);
+          const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+          const blob = new Blob([plain], { type: pkg.fileType || "application/octet-stream" });
+          downloadBlob(blob, pkg.fileName || "decrypted-file");
+          notify("success", "Decryption successful. Your original file has been downloaded.");
+        } catch (error) {
+          console.error(error);
+          notify("error", "Decryption failed. Check your passphrase and make sure the vault file has not been modified.");
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const downloadPackage = () => {
+        if (!packageData) return;
+        const blob = new Blob([JSON.stringify(packageData, null, 2)], { type: "application/json" });
+        downloadBlob(blob, (packageData.fileName || "file") + ".pqvault");
+      };
+
+      const generateDemoKeys = () => {
+        // Educational placeholder only. This is NOT ML-KEM-768/FIPS 203.
+        setSimKeys({
+          publicKey: "DEMO-PUBLIC-" + randomHex(24),
+          privateKey: "DEMO-PRIVATE-" + randomHex(32),
+          generatedAt: new Date().toLocaleString()
+        });
+      };
+
+      const copyText = async (value) => {
+        try {
+          await navigator.clipboard.writeText(value);
+          notify("success", "Copied to clipboard.");
+        } catch {
+          notify("error", "Clipboard access was blocked by your browser.");
+        }
+      };
+
+      return (
+        <div className="min-h-screen">
+          <div className="fixed inset-0 pointer-events-none opacity-30" style={{backgroundImage:"radial-gradient(#334155 1px, transparent 1px)",backgroundSize:"24px 24px"}}></div>
+          <header className="sticky top-0 z-20 border-b border-slate-800 bg-slate-950/95 backdrop-blur px-4 lg:px-8 py-4">
+            <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-cyan-400 to-emerald-400 p-0.5">
+                  <div className="w-full h-full rounded-xl bg-slate-950 flex items-center justify-center text-cyan-300 text-2xl"><Icon name="Shield"/></div>
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h1 className="font-black tracking-wider text-xl bg-gradient-to-r from-cyan-300 to-emerald-300 bg-clip-text text-transparent">AETHER-VAULT</h1>
+                    <span className="text-[9px] uppercase tracking-wider rounded-full border border-amber-700/60 bg-amber-950/50 px-2 py-1 text-amber-300">Security demo</span>
+                  </div>
+                  <p className="text-xs text-slate-400">Browser-based encrypted file vault</p>
+                </div>
+              </div>
+              <nav className="flex flex-wrap justify-center gap-1 rounded-xl border border-slate-800 bg-slate-900 p-1">
+                {[
+                  ["vault","▣","File Vault"],
+                  ["visualizer","▱","Key Demo"],
+                  ["specs","▦","PQC Standards"]
+                ].map(([id, icon, label]) =>
+                  <button key={id} onClick={() => {setTab(id);setStatus(null);}}
+                    className={"rounded-lg px-4 py-2 text-xs font-semibold transition " + (tab===id ? "bg-cyan-500 text-slate-950" : "text-slate-400 hover:bg-slate-800 hover:text-white")}>
+                    <span className="mr-2">{icon}</span>{label}
+                  </button>
+                )}
+              </nav>
+            </div>
+          </header>
+
+          <main className="relative z-10 max-w-7xl mx-auto px-4 lg:px-8 py-8">
+            <section className="mb-7 rounded-2xl border border-cyan-900/60 bg-gradient-to-r from-slate-900 to-cyan-950/30 p-5">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-[.2em] text-cyan-400">Local encryption</p>
+                  <h2 className="mt-1 text-lg font-bold">Your files stay in your browser</h2>
+                  <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-400">Files are encrypted locally using AES-256-GCM. Your passphrase is used to derive the encryption key and is not uploaded.</p>
+                </div>
+                <div className="rounded-xl border border-emerald-800/60 bg-emerald-950/30 px-4 py-3 text-xs text-emerald-300">● Web Crypto API</div>
+              </div>
+            </section>
+
+            {status && <div role="status" className={"mb-6 rounded-xl border p-4 text-sm " + (status.type==="success" ? "border-emerald-800 bg-emerald-950/40 text-emerald-300" : "border-rose-800 bg-rose-950/40 text-rose-300")}>{status.type==="success"?"✓ ":"⚠ "}{status.message}</div>}
+
+            {tab === "vault" && (
+              <section>
+                <div className="mb-5 flex flex-wrap gap-2 border-b border-slate-800 pb-3">
+                  <button onClick={()=>{setMode("encrypt");setStatus(null);}} className={"rounded-lg px-4 py-2 text-xs font-semibold "+(mode==="encrypt"?"bg-cyan-500 text-slate-950":"bg-slate-900 text-slate-400")}>🔒 Encrypt a file</button>
+                  <button onClick={()=>{setMode("decrypt");setStatus(null);}} className={"rounded-lg px-4 py-2 text-xs font-semibold "+(mode==="decrypt"?"bg-cyan-500 text-slate-950":"bg-slate-900 text-slate-400")}>🔓 Decrypt a vault</button>
+                </div>
+
+                {mode === "encrypt" ? (
+                  <div className="grid gap-6 lg:grid-cols-5">
+                    <div className="lg:col-span-3 rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
+                      <h3 className="mb-1 font-bold">Encrypt a file</h3>
+                      <p className="mb-5 text-xs text-slate-400">Choose any file and create a portable .pqvault encrypted package.</p>
+                      <label className="dropzone flex min-h-48 cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-700 bg-slate-950/60 p-6 text-center">
+                        <span className="mb-3 text-4xl text-cyan-400">↑</span>
+                        <span className="text-sm font-semibold">{file ? file.name : "Click to choose a file"}</span>
+                        <span className="mt-2 text-xs text-slate-500">{file ? `${(file.size/1024).toFixed(1)} KB` : "Your file is processed locally in this browser"}</span>
+                        <input type="file" className="hidden" onChange={e=>{setFile(e.target.files?.[0]||null);setPackageData(null);setStatus(null);}} />
+                      </label>
+                      <label className="mt-5 block text-xs font-semibold text-slate-300">Encryption passphrase (minimum 12 characters)</label>
+                      <div className="mt-2 flex gap-2">
+                        <input value={passphrase} onChange={e=>setPassphrase(e.target.value)} type={showPassword?"text":"password"} autoComplete="new-password" placeholder="Create a strong passphrase" className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-3 text-sm outline-none focus:border-cyan-500" />
+                        <button onClick={()=>setShowPassword(!showPassword)} className="rounded-lg border border-slate-700 px-3 text-xs text-slate-300">{showPassword?"Hide":"Show"}</button>
+                      </div>
+                      <p className="mt-2 text-[11px] text-slate-500">Keep this passphrase safe. There is no password reset or recovery service.</p>
+                      <button disabled={!file || passphrase.length<12 || busy} onClick={encryptFile} className="mt-5 w-full rounded-xl bg-gradient-to-r from-cyan-500 to-teal-400 px-5 py-3 text-sm font-bold text-slate-950 hover:brightness-110">
+                        {busy?"Encrypting…":"Encrypt file"}
+                      </button>
+                    </div>
+
+                    <div className="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
+                      <h3 className="font-bold">Vault package</h3>
+                      <p className="mb-5 mt-1 text-xs text-slate-400">Your encrypted package is portable and can be decrypted later using the same passphrase.</p>
+                      {packageData ? (
+                        <div className="space-y-4">
+                          <div className="rounded-xl border border-emerald-800 bg-emerald-950/30 p-4 text-sm text-emerald-300">✓ Encryption complete</div>
+                          <div className="rounded-lg bg-slate-950 p-3 text-xs">
+                            <p className="text-slate-500">File</p><p className="mt-1 break-all">{packageData.fileName}</p>
+                            <p className="mt-3 text-slate-500">Algorithm</p><p className="mt-1 text-cyan-300">{packageData.encryption}</p>
+                            <p className="mt-3 text-slate-500">Key derivation</p><p className="mt-1">{packageData.keyDerivation}</p>
+                            <p className="mt-3 text-slate-500">Encrypted data</p><p className="mt-1">{(packageData.ciphertextHex.length/2/1024).toFixed(1)} KB</p>
+                          </div>
+                          <button onClick={downloadPackage} className="w-full rounded-xl bg-emerald-400 px-4 py-3 text-sm font-bold text-slate-950 hover:bg-emerald-300">↓ Download .pqvault</button>
+                        </div>
+                      ) : <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-slate-800 p-5 text-center text-slate-500"><span className="text-4xl">▣</span><p className="mt-3 text-xs">Your encrypted package details will appear here.</p></div>}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mx-auto max-w-3xl rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
+                    <h3 className="font-bold">Decrypt a .pqvault package</h3>
+                    <p className="mb-5 mt-1 text-xs text-slate-400">Select a previously downloaded AETHER-VAULT package and enter the original passphrase.</p>
+                    <label className="dropzone flex min-h-36 cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-700 bg-slate-950/60 p-5 text-center">
+                      <span className="text-3xl text-cyan-400">↑</span>
+                      <span className="mt-2 text-sm font-semibold">{vaultFile ? vaultFile.name : "Choose .pqvault file"}</span>
+                      <input type="file" accept=".pqvault,.json,application/json" className="hidden" onChange={e=>selectVaultFile(e.target.files?.[0])} />
+                    </label>
+                    <label className="mt-5 block text-xs font-semibold">Original passphrase</label>
+                    <input type="password" value={decryptPassword} onChange={e=>setDecryptPassword(e.target.value)} autoComplete="current-password" placeholder="Enter the encryption passphrase" className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-3 text-sm outline-none focus:border-cyan-500" />
+                    <button disabled={!vaultFile || !decryptPassword || busy} onClick={decryptFile} className="mt-5 w-full rounded-xl bg-gradient-to-r from-cyan-500 to-teal-400 px-5 py-3 text-sm font-bold text-slate-950 hover:brightness-110">{busy?"Decrypting…":"Decrypt and download original file"}</button>
+                  </div>
+                )}
+              </section>
+            )}
+
+            {tab === "visualizer" && (
+              <section className="grid gap-6 lg:grid-cols-2">
+                <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
+                  <p className="text-xs font-bold uppercase tracking-widest text-cyan-400">Educational visualization</p>
+                  <h2 className="mt-2 text-xl font-bold">Post-quantum key exchange concept</h2>
+                  <p className="mt-3 text-sm leading-6 text-slate-400">This panel generates random demonstration strings to illustrate the public/private key concept. It does not perform ML-KEM, Kyber, lattice arithmetic, encapsulation, or decapsulation.</p>
+                  <button onClick={generateDemoKeys} className="mt-6 rounded-xl bg-cyan-500 px-5 py-3 text-sm font-bold text-slate-950 hover:bg-cyan-400">↻ Generate demo keys</button>
+                  {simKeys && <div className="mt-6 space-y-4">
+                    <div className="rounded-xl border border-cyan-900 bg-slate-950 p-4"><div className="mb-2 flex justify-between text-xs text-cyan-300"><b>Demo public key</b><button onClick={()=>copyText(simKeys.publicKey)}>Copy</button></div><p className="mono break-all text-xs text-slate-300">{simKeys.publicKey}</p></div>
+                    <div className="rounded-xl border border-amber-900 bg-slate-950 p-4"><div className="mb-2 flex justify-between text-xs text-amber-300"><b>Demo private key</b><button onClick={()=>copyText(simKeys.privateKey)}>Copy</button></div><p className="mono break-all text-xs text-slate-300">{simKeys.privateKey}</p></div>
+                    <p className="text-[11px] text-slate-500">Generated: {simKeys.generatedAt}</p>
+                  </div>}
+                </div>
+                <div className="rounded-2xl border border-amber-900/60 bg-amber-950/20 p-6">
+                  <h3 className="font-bold text-amber-300">Important implementation note</h3>
+                  <p className="mt-3 text-sm leading-6 text-slate-300">The file vault in this version uses real browser AES-256-GCM encryption with a passphrase-derived key. The key-exchange panel is only a visual demonstration. Do not describe this build as implementing NIST ML-KEM-768 or as providing post-quantum key exchange.</p>
+                  <p className="mt-4 text-xs leading-5 text-slate-400">For a genuine hybrid post-quantum system, integrate a reviewed FIPS 203 ML-KEM implementation, validate its API and test vectors, and combine the resulting shared secret with a suitable KDF before deriving the symmetric encryption key.</p>
+                </div>
+              </section>
+            )}
+
+            {tab === "specs" && (
+              <section className="space-y-5">
+                <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6">
+                  <p className="text-xs font-bold uppercase tracking-widest text-cyan-400">Standards overview</p>
+                  <h2 className="mt-2 text-xl font-bold">NIST post-quantum cryptography</h2>
+                  <p className="mt-3 max-w-4xl text-sm leading-6 text-slate-400">Post-quantum cryptography (PQC) is designed to resist attacks from both classical and sufficiently capable quantum computers. NIST published its first three finalized PQC standards in 2024.</p>
+                </div>
+                <div className="grid gap-4 md:grid-cols-3">
+                  {[
+                    ["FIPS 203","ML-KEM","Key encapsulation mechanism based on module-lattice cryptography. Formerly known as CRYSTALS-Kyber."],
+                    ["FIPS 204","ML-DSA","Digital signature algorithm based on module-lattice cryptography. Formerly known as CRYSTALS-Dilithium."],
+                    ["FIPS 205","SLH-DSA","Stateless hash-based digital signature algorithm. Formerly known as SPHINCS+."]
+                  ].map(([standard,name,description])=><article key={standard} className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5"><p className="text-xs font-bold text-cyan-400">{standard}</p><h3 className="mt-2 text-lg font-bold">{name}</h3><p className="mt-3 text-xs leading-5 text-slate-400">{description}</p></article>)}
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5 text-xs leading-5 text-slate-400">This project currently demonstrates file encryption using AES-256-GCM and PBKDF2. It does not implement any of the three NIST post-quantum standards above.</div>
+              </section>
+            )}
+
+            <footer className="mt-12 border-t border-slate-800 pt-5 text-center text-[11px] leading-5 text-slate-500">
+              AETHER-VAULT educational project · Encryption runs locally in your browser · Never lose your passphrase
+            </footer>
+          </main>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
