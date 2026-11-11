@@ -390,7 +390,7 @@
           });
         } catch (err) {
           setDecryptError("Decryption Failed! Invalid Private Key or corrupted ciphertext vector. AES-256-GCM authentication tag mismatch.");
-        } fontally: {
+        } finally {
           setIsDecrypting(false);
         }
       };
